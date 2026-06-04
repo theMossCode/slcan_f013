@@ -24,6 +24,7 @@
 #include "ring_buf.h"
 #include "utils.h"
 
+#include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -54,6 +55,17 @@ enum{
 	CAN_BITRATE_800K,
 	CAN_BITRATE_1M
 };
+
+enum{
+	ERR_FLAG_CAN_RX_FIFO_FULL,
+	ERR_FLAG_CAN_TX_FIFO_FULL,
+	ERR_FLAG_CAN_ERR_WARNING,
+	ERR_FLAG_DATA_ORR,
+	ERR_FLAG_RESERVED,
+	ERR_FLAG_PASSIVE,
+	ERR_FLAG_ARBITRATION_LOSS,
+	ERR_FLAG_BUS_ERR
+};
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -64,8 +76,12 @@ enum{
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan;
 
+TIM_HandleTypeDef htim2;
+
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_rx;
+
+static uint8_t uart_has_err = 0;
 
 /* USER CODE BEGIN PV */
 
@@ -77,36 +93,41 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_CAN_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 static struct ring input_ring;
 static struct ring output_ring;
 
 static uint8_t input_buf[RING_BUFFER_SIZE];
-static uint8_t rx_ch[256];
+static uint8_t rx_ch[RING_BUFFER_SIZE];
 
 static uint16_t last_dma_pos;
 static uint16_t current_dma_pos;
 
-volatile uint8_t commands_pending;
+//volatile uint8_t commands_pending;
 
 static uint8_t channel_open = 0;
 static CAN_TxHeaderTypeDef tx_header;
 static uint8_t uart_tx_busy;
 uint32_t rx_active = 0;
 uint32_t tx_active = 0;
+uint8_t can_err = 0;
 
-#define CAN_BUF_SIZE		256
+#define CAN_BUF_SIZE	512
 
 can_packet_t can_buf[CAN_BUF_SIZE];
 
 
 static uint16_t can_buf_head = 0;
 static uint16_t can_buf_tail = 0;
+
+static uint64_t ns_count = 0;
 
 static int can_buf_get(can_packet_t *packet)
 {
@@ -137,7 +158,8 @@ static void can_buf_add(can_packet_t *packet)
 	}
 
 	if(next == can_buf_tail){
-		(void)can_buf_get(NULL);
+		can_err |= (1 << ERR_FLAG_CAN_RX_FIFO_FULL);
+		return;
 	}
 
 	memcpy(&can_buf[can_buf_head], packet, sizeof(can_packet_t));
@@ -182,7 +204,12 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 	}
 }
 
-static int uart_read_blocking(uint8_t *c)
+void HAL_UART_ErrorCallback (UART_HandleTypeDef * huart)
+{
+	uart_has_err = 1;
+}
+
+static int uart_read_blocking(uint8_t *c, uint32_t timeout)
 {
 	uint8_t rx_complete;
 	uint32_t start_ms;
@@ -190,34 +217,30 @@ static int uart_read_blocking(uint8_t *c)
 	start_ms = HAL_GetTick();
 	rx_complete = 0;
 
-	// Wait for DMA data
-	do{
-		uint32_t dma_counter = __HAL_DMA_GET_COUNTER(&hdma_usart2_rx);
-		current_dma_pos = (uint16_t)(sizeof(rx_ch)/sizeof(rx_ch[0])) - dma_counter;
-		// Already data in buffer
-		if(ring_read_ch(&input_ring, c)){
-			rx_complete = 1;
-			break;
-		}
+	if(ring_read_ch(&input_ring, c) <= 0){
+		// Wait for DMA data
+		do{
+			uint32_t dma_counter = __HAL_DMA_GET_COUNTER(&hdma_usart2_rx);
+			current_dma_pos = (uint16_t)(sizeof(rx_ch)/sizeof(rx_ch[0])) - dma_counter;
+			if(HAL_GetTick() - start_ms > timeout){
+				return -10;
+			}
+		}while(current_dma_pos == last_dma_pos);
 
-		if(HAL_GetTick() - start_ms > 10){
-			return -10;
-		}
-	}while(current_dma_pos == last_dma_pos);
-
-	if(!rx_complete){
 		if(current_dma_pos > last_dma_pos){
 			(void)ring_write(&input_ring, &rx_ch[last_dma_pos], current_dma_pos - last_dma_pos);
 		}
 		else if(current_dma_pos < last_dma_pos){
-			(void)ring_write(&input_ring, &rx_ch[last_dma_pos], sizeof(rx_ch) - last_dma_pos);
+			(void)ring_write(&input_ring, &rx_ch[last_dma_pos], (sizeof(rx_ch)/sizeof(rx_ch[0])) - last_dma_pos);
 			if(current_dma_pos > 0){
 				(void)ring_write(&input_ring, &rx_ch[0], current_dma_pos);
 			}
 		}
 
 		last_dma_pos = current_dma_pos;
-		(void)ring_read_ch(&input_ring, c);
+		if(ring_read_ch(&input_ring, c) <= 0){
+			return -10;
+		}
 	}
 
 	return 0;
@@ -376,9 +399,19 @@ static int can_init(int index)
 
 static int can_speed(int index)
 {
+	int res;
 	HAL_GPIO_WritePin(CAN_STDBY_GPIO_Port, CAN_STDBY_Pin, 0);
+	HAL_Delay(1);
 	DEBUG_PRINT("Speed %d", index);
-	return can_init(index);
+	res = can_init(index);
+	if(res < 0){
+		can_err |= (1 << ERR_FLAG_BUS_ERR);
+	}
+	else{
+		can_err &= ~(1 << ERR_FLAG_BUS_ERR);
+	}
+
+	return res;
 }
 
 static uint32_t get_nibbles(int nibbles)
@@ -389,7 +422,7 @@ static uint32_t get_nibbles(int nibbles)
 
 	id = 0;
 	for (i = 0; i < nibbles; i++) {
-		if(uart_read_blocking(&c) == 0){
+		if(uart_read_blocking(&c, 5) >= 0){
 			id <<= 4;
 			id |= nibble2bin(c);
 		}
@@ -397,7 +430,7 @@ static uint32_t get_nibbles(int nibbles)
 	return id;
 }
 
-static void dump_can_messages()
+static int dump_can_messages()
 {
 	can_packet_t tmp;
 	static uint8_t tx_buf[128];
@@ -405,6 +438,7 @@ static void dump_can_messages()
 	char c;
 
 	if(can_buf_get(&tmp) > 0){
+		can_err &= ~(1 << ERR_FLAG_CAN_RX_FIFO_FULL);
 		if(tmp.id.rtr == CAN_RTR_REMOTE){
 			if(tmp.id.ide == CAN_ID_EXT){
 				tx_buf[tx_index++] = 'R';
@@ -469,168 +503,213 @@ static void dump_can_messages()
 			tx_index += 2;
 		}
 
-//		(void)ring_write_ch(&output_ring, '\r');
 		tx_buf[tx_index++] = '\r';
-
-//		uint8_t output_c;
-//		while(ring_read_ch(&output_ring, &output_c)){
-//			while(HAL_DMA_GetState(&hdma_usart2_tx) == HAL_DMA_STATE_BUSY){;}
-//			HAL_UART_Transmit_DMA(&huart2, tx_buf, tx_index);
-			HAL_UART_Transmit(&huart2, tx_buf, tx_index, HAL_MAX_DELAY);
-//		}
-
+		while(HAL_UART_Transmit(&huart2, tx_buf, tx_index, HAL_MAX_DELAY) != HAL_OK){
+//			HAL_Delay(1);
+		}
 		rx_active++;
+		return 1;
 	}
+
+	return -1;
+}
+
+static int transmit_can_packet(uint32_t id, uint32_t ext, uint32_t rtr, uint8_t dlc, const uint8_t *data)
+{
+	DEBUG_PRINT("Send");
+	uint32_t mailbox;
+	CAN_TxHeaderTypeDef tx_header;
+	uint32_t can_tx_ms;
+
+	tx_header.DLC = dlc;
+	tx_header.IDE = ext ? CAN_ID_EXT : CAN_ID_STD;
+	tx_header.RTR = rtr ? CAN_RTR_REMOTE : CAN_RTR_DATA;
+	tx_header.StdId = tx_header.ExtId = id;
+
+	can_tx_ms = HAL_GetTick();
+
+	// Blink LED on successful uart reception
+	tx_active++;
+
+	do{
+		if(HAL_CAN_AddTxMessage(&hcan, &tx_header, data, &mailbox) == HAL_OK){
+			can_err &= ~(1 << ERR_FLAG_CAN_TX_FIFO_FULL);
+			return 0;
+		}
+	}while(HAL_GetTick() - can_tx_ms < 10);
+	can_err |= (1 << ERR_FLAG_CAN_TX_FIFO_FULL);
+
+	return -1;
+}
+
+static int wait_msg_end()
+{
+	int res = -1;
+	uint32_t start_ms;
+	start_ms = HAL_GetTick();
+	do{
+		uint8_t c = 0;
+		(void)uart_read_blocking(&c, 50);
+		if(c == '\r'){
+			res = 0;
+			break;
+		}
+	}while(HAL_GetTick() - start_ms < 100);
+
+	return res;
 }
 
 static int slcan_command(void)
 {
-	//    static bool sw_flow = true;
-	bool ext, rtr;
-	uint8_t i, dlc, data[8] = {0};
-	uint32_t id;
-	int32_t ret;
-	uint8_t c;
-	bool send;
+	uint8_t tx = 0;
+	uint8_t ext=0, rtr=0;
+	uint8_t dlc=0, data[8] = {0};
+	uint32_t id=0;
+	uint8_t c=0;
 
-	id = 0;
-	dlc = 0;
-	ext = true;
-	send = true;
-	rtr = false;
-	ret = 0;
-	c = 0;
-
-//	if(HAL_CAN_GetTxMailboxesFreeLevel(&hcan) == 0){
-//		__asm__("nop");
-//		return -1;
-//	}
-
-	if(uart_read_blocking(&c) != 0){
-		return -1;
+	if(uart_read_blocking(&c, 5) < 0){
+		return -100;
 	}
-//	while(uart_read_blocking(&c) < 0);
 
-	DEBUG_PRINT("Uart RX");
+	DEBUG_PRINT("Uart RX %c", c);
 
 	switch (c) {
 	case 'T':
+		ext = 1;
 		id = get_nibbles(8);
 		dlc = (uint8_t)get_nibbles(1);
+		if(dlc > 8){
+			return -10;
+		}
+
+		if(channel_open){
+			tx = 1;
+		}
+		else{
+			wait_msg_end();
+			return -10;
+		}
 		break;
 	case 't':
-		ext = false;
 		id = get_nibbles(3);
 		dlc = (uint8_t)get_nibbles(1);
+		if(dlc > 8){
+			return -10;
+		}
+
+		if(channel_open){
+			tx = 1;
+		}
+		else{
+			wait_msg_end();
+			return -10;
+		}
 		break;
 	case 'R':
-		rtr = true;
-		ext = true;
+		rtr = 1;
+		ext = 1;
 		id = get_nibbles(8);
 		dlc = (uint8_t)get_nibbles(1);
+		if(channel_open){
+			tx = 1;
+		}
+		else{
+			wait_msg_end();
+			return -10;
+		}
 		break;
 	case 'r':
-		rtr = true;
-		ext = false;
+		rtr = 1;
 		id = get_nibbles(3);
 		dlc = (uint8_t)get_nibbles(1);
+		if(channel_open){
+			tx = 1;
+		}
+		else{
+			wait_msg_end();
+			return -10;
+		}
 		break;
 	case 'S':
 		c = (uint8_t)get_nibbles(1);
-		ret = can_speed(c);
-		send = false;
+		if(wait_msg_end() < 0){
+			return -10;
+		}
+
+		if(can_speed(c) < 0){
+			return -10;
+		}
 		break;
 	case 'v':
-		send = false;
-		break;
 	case 'V':
-		send = false;
+		if(wait_msg_end() < 0){
+			return -10;
+		}
+
+		const char *ver = "V0101";
+		if(HAL_UART_Transmit(&huart2, (const uint8_t *)ver, strlen(ver), 100) != HAL_OK){
+			return -10;
+		}
 		break;
 	case 'C':
-		// Close channel
-		//    	if(!channel_open){
-		//    		ret = -1;
-		//    	}
-
+		if(wait_msg_end() < 0){
+			return -10;
+		}
 		channel_open = 0;
-		send = false;
 		break;
+	case 'o':
 	case 'O':{
-		//    	if(channel_open){
-		//    		ret = -1;
-		//    	}
+		if(wait_msg_end() < 0){
+			return -10;
+		}
 
+		DEBUG_PRINT("Open channel");
 		channel_open = 1;
-		send = false;
 		break;
 	}
+	case 'N':{
+		if(wait_msg_end() < 0){
+			return -10;
+		}
+
+		const char *sn = "NGE01";
+		if(HAL_UART_Transmit(&huart2, (const uint8_t *)sn, strlen(sn), 100) != HAL_OK){
+			return -10;
+		}
+		break;
+	}
+	case 'F':
+		if(wait_msg_end() < 0){
+			return -10;
+		}
+
+		char resp[8] = {0};
+		snprintf(resp, sizeof(resp), "F%02x", can_err);
+		if(HAL_UART_Transmit(&huart2, (const uint8_t *)resp, strlen(resp), 100) != HAL_OK){
+			return -10;
+		}
+		break;
 	default:
-		send = false;
 		break;
 	}
-	if (dlc > 8) {
-		/* consume chars until eol reached */
-		do {
-			ret = uart_read_blocking(&c);
-			if(ret < 0){
-				break;
-			}
-		} while (c != '\r');
-		return -1;
+
+	if(tx){
+		for (int i = 0; i < dlc; i++) {
+			data[i] = (uint8_t)get_nibbles(2);
+		}
+
+		if(wait_msg_end() < 0){
+			return -10;
+		}
+
+		if(transmit_can_packet(id, ext, rtr, dlc, data) < 0){
+			return -10;
+		}
+
+		DEBUG_PRINT("Transmit");
 	}
 
-	for (i = 0; i < dlc; i++) {
-		data[i] = (uint8_t)get_nibbles(2);
-	}
-
-	/* consume chars until eol reached */
-	do {
-		ret = uart_read_blocking(&c);
-		if(ret < 0){
-			break;
-		}
-	} while (c != '\r');
-
-#if 1
-	if (send) {
-
-		uint32_t mailbox;
-
-		tx_header.DLC = dlc;
-		tx_header.IDE = ext ? CAN_ID_EXT : CAN_ID_STD;
-		tx_header.RTR = rtr ? CAN_RTR_REMOTE : CAN_RTR_DATA;
-		if(tx_header.IDE == CAN_ID_STD){
-			tx_header.StdId = id;
-		}
-		else{
-			tx_header.ExtId = id;
-		}
-
-		if(HAL_CAN_AddTxMessage(&hcan, &tx_header, data, &mailbox) != HAL_OK){
-			ret = -1;
-		}
-		else{
-			tx_active++;
-		}
-	}
-#else
-	if (send) {
-		int loop = CAN_MAX_RETRY;
-		/* try to send data - omit if not possible */
-		while (loop-- > 0) {
-			if (can_available_mailbox(CAN1))
-				break;
-			/* TODO: LED overflow */
-		}
-		ret = can_transmit(CAN1, id, ext, rtr, dlc, data);
-		gpio_debug(ret);
-	}
-#endif
-
-	if (commands_pending)
-		commands_pending--;
-
-	return ret;
+	return 0;
 }
 
 
@@ -681,6 +760,7 @@ int main(void)
   MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_CAN_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 	DEBUG_PRINT("Init..");
   /* USER CODE END 2 */
@@ -688,17 +768,17 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 	ring_setup(&input_ring, input_buf, RING_BUFFER_SIZE);
-//	ring_setup(&output_ring, output_buf, RING_BUFFER_SIZE);
-
 	last_dma_pos = 0;
-	commands_pending = 0;
-
 	uart_tx_busy = 0;
+
+	HAL_Delay(1000);
 
 	DEBUG_PRINT("Start..");
 	can_speed(6);
-	while(HAL_UART_Receive_DMA(&huart2, rx_ch, sizeof(rx_ch)/sizeof(rx_ch[0])) != HAL_OK);
+	HAL_TIM_Base_Start_IT(&htim2);
 
+	HAL_Delay(1000);
+	while(HAL_UART_Receive_DMA(&huart2, rx_ch, sizeof(rx_ch)/sizeof(rx_ch[0])) != HAL_OK);
 	static uint8_t rsp;
 	while (1)
 	{
@@ -706,19 +786,26 @@ int main(void)
 		slcan_ret = slcan_command();
 		if(slcan_ret == 0){
 			rsp = '\r';
-//			while(HAL_DMA_GetState(&hdma_usart2_tx) == HAL_DMA_STATE_BUSY){;}
-//			HAL_UART_Transmit_DMA(&huart2, &rsp, 1);
 			HAL_UART_Transmit(&huart2, &rsp, 1, HAL_MAX_DELAY);
+			DEBUG_PRINT("Complete Message");
 		}
-		else if(slcan_ret == -1){
+		else if(slcan_ret >= -10){
 			rsp = 0x07;
-//			while(HAL_DMA_GetState(&hdma_usart2_tx) == HAL_DMA_STATE_BUSY){;}
-//			HAL_UART_Transmit_DMA(&huart2, &rsp, 1);
 			HAL_UART_Transmit(&huart2, &rsp, 1, HAL_MAX_DELAY);
-			HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
 		}
 
-		dump_can_messages();
+		(void)dump_can_messages();
+
+		if(uart_has_err){
+			__HAL_UART_CLEAR_FEFLAG(&huart2);
+			__HAL_UART_CLEAR_OREFLAG(&huart2);
+			__HAL_UART_CLEAR_PEFLAG(&huart2);
+			HAL_Delay(1);
+			if(HAL_UART_Receive_DMA(&huart2, rx_ch, sizeof(rx_ch)/sizeof(rx_ch[0])) == HAL_OK){
+				uart_has_err = 0;
+			}
+		}
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -738,12 +825,13 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
-  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL16;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL8;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -762,6 +850,10 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
+  /** Enables the Clock Security System
+  */
+  HAL_RCC_EnableCSS();
 }
 
 /**
@@ -787,9 +879,9 @@ static void MX_CAN_Init(void)
   hcan.Init.TimeSeg2 = CAN_BS2_4TQ;
   hcan.Init.TimeTriggeredMode = DISABLE;
   hcan.Init.AutoBusOff = ENABLE;
-  hcan.Init.AutoWakeUp = DISABLE;
+  hcan.Init.AutoWakeUp = ENABLE;
   hcan.Init.AutoRetransmission = ENABLE;
-  hcan.Init.ReceiveFifoLocked = DISABLE;
+  hcan.Init.ReceiveFifoLocked = ENABLE;
   hcan.Init.TransmitFifoPriority = ENABLE;
   if (HAL_CAN_Init(&hcan) != HAL_OK)
   {
@@ -798,6 +890,54 @@ static void MX_CAN_Init(void)
   /* USER CODE BEGIN CAN_Init 2 */
 
   /* USER CODE END CAN_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 159;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 9;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV4;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_OC_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_OC_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -817,7 +957,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 2000000;
+  huart2.Init.BaudRate = 1000000;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -862,6 +1002,7 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
@@ -890,7 +1031,12 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+	if(htim->Instance == htim2.Instance){
+		ns_count++;
+	}
+}
 /* USER CODE END 4 */
 
 /**
@@ -904,6 +1050,7 @@ void Error_Handler(void)
 	__disable_irq();
 	while (1)
 	{
+		NVIC_SystemReset();
 	}
   /* USER CODE END Error_Handler_Debug */
 }

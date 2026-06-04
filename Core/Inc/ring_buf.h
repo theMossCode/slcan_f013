@@ -31,7 +31,7 @@
 
 #include <stdint.h>
 
-#define RING_BUFFER_SIZE 1024
+#define RING_BUFFER_SIZE 512
 
 typedef uint32_t ring_size_t;
 
